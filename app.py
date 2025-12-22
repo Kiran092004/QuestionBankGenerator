@@ -799,6 +799,10 @@ if mode == 'Generate':
                 grade
             )
 
+            if not subjects:
+                st.error("❌ No subjects found for selected Grade / Board / Medium")
+                st.stop()
+
             subject_map = {s['subject_name']: s['id'] for s in subjects}
 
             subject = st.selectbox(
@@ -806,14 +810,15 @@ if mode == 'Generate':
                 options=list(subject_map.keys())
             )
 
+
         st.markdown("---")
 
-
         uploaded_files = st.file_uploader(
-    "Upload chapter files (PDF/DOCX)",
-    type=["pdf", "docx"],
-    accept_multiple_files=True
-)
+            "Upload chapter files (PDF/DOCX)",
+            type=["pdf", "docx"],
+            accept_multiple_files=True
+        )
+
 
         existing_files = [f for f in os.listdir(DOCS_DIR) if f.lower().endswith(('.pdf', '.docx'))]
         gen_btn = st.button('Generate Questions', key='gen')
@@ -855,10 +860,16 @@ if mode == 'Generate':
             chapter_title = extract_chapter_title(chapter_text)
 
             # Detect chapter using DB (THIS IS THE ONLY FUNCTION CALL)
+            subject_id = subject_map.get(subject)
+
+            if not subject_id:
+                st.error("❌ Invalid subject selection")
+                continue
+
             matched_chapter = detect_chapter_from_db(
                 chapter_title=chapter_title,
                 filename=dest.name,
-                grade_subject_id=subject_map[subject]
+                grade_subject_id=subject_id
             )
 
             if not matched_chapter:
