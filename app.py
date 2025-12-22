@@ -31,12 +31,6 @@ try:
 except Exception:
     mysql = None
 
-st.session_state.setdefault("is_generating", False)
-st.session_state.setdefault("generation_done", False)
-st.session_state.setdefault("generated_files", [])
-st.session_state.setdefault("status_text", "Idle")
-st.session_state.setdefault("progress_value", 0.0)
-
 st.set_page_config(
     page_title="Assessment Question Generator",
     layout="wide",
@@ -45,6 +39,14 @@ st.set_page_config(
 
 if "app_started" not in st.session_state:
     st.session_state.app_started = True
+
+st.session_state.setdefault("is_generating", False)
+st.session_state.setdefault("generation_done", False)
+st.session_state.setdefault("generated_files", [])
+st.session_state.setdefault("status_text", "Idle")
+st.session_state.setdefault("progress_value", 0.0)
+
+
 
 
 # ------------------ Config & folders ------------------
@@ -1087,4 +1089,5 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
+
 
