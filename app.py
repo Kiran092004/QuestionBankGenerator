@@ -1,17 +1,3 @@
-import streamlit as st
-
-st.set_page_config(
-    page_title="Assessment Question Generator",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-if "app_started" not in st.session_state:
-    st.session_state.app_started = True
-
-# ------------------ SAFE UI UPDATE (CRITICAL FOR RENDER) ------------------
-
-
 import os
 import re
 import json
@@ -21,7 +7,7 @@ import difflib
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-
+import streamlit as st
 
 # Optional libs
 try:
@@ -44,15 +30,11 @@ try:
 except Exception:
     mysql = None
 
-
-
 st.session_state.setdefault("is_generating", False)
-st.session_state.setdefault("lock_ui", False)
 st.session_state.setdefault("generation_done", False)
 st.session_state.setdefault("generated_files", [])
 st.session_state.setdefault("status_text", "Idle")
 st.session_state.setdefault("progress_value", 0.0)
-
 
 
 
@@ -68,6 +50,7 @@ for p in (DOCS_DIR, OUTPUT_DIR, UPLOAD_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 # ------------------ UI styling ------------------
+st.set_page_config(page_title='Assessment Question Generator', layout='wide', initial_sidebar_state='expanded')
 DARK_CSS = """
 <style>
 body {
@@ -796,17 +779,7 @@ def fetch_subjects(learning_medium_id, board_id, grade_id):
 
 # ------------------ Streamlit UI ------------------
 st.sidebar.title('Generator — Dark Dashboard')
-
-if st.session_state.get("lock_ui", False):
-    st.sidebar.warning("⚙️ Generation in progress… Please wait")
-    st.stop()
-
-mode = st.sidebar.radio(
-    'Mode',
-    ['Generate', 'Insert to DB', 'View Outputs', 'Logs']
-)
-
-
+mode = st.sidebar.radio('Mode', ['Generate', 'Insert to DB', 'View Outputs', 'Logs'])
 
 if mode == 'Generate':
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -885,112 +858,171 @@ if mode == 'Generate':
         st.write(f'API keys configured: {len(API_KEYS)}')
         st.write(f'Output folder: {OUTPUT_DIR}')
         st.write('')
-
+        status_box = st.empty()
+        progress_bar = st.progress(0)
+        percent_box = st.empty()
 
 
     if gen_btn:
-        st.session_state.lock_ui = True
+        st.session_state.is_generating = True
+        st.session_state.generation_done = False
         st.session_state.generated_files = []
+
 
         if not uploaded_files:
             st.error("Please upload at least one chapter file")
-            st.session_state.lock_ui = False
             st.stop()
 
         model = setup_genai_model()
 
-        # ✅ ONLY ONE UI MESSAGE DURING LONG TASK
-        with st.spinner("⏳ Generating questions. This may take a few minutes..."):
+        total_files = len(uploaded_files)
+        completed_files = 0
 
-            for uploaded in uploaded_files:
+        st.session_state.status_text = "Starting generation..."
+        st.session_state.progress_value = 0.0
 
-                name = normalize_filename(uploaded.name)
-                dest = UPLOAD_DIR / name
+        status_box.info(st.session_state.status_text)
+        progress_bar.progress(0)
+        percent_box.write("0% completed")
 
-                with open(dest, "wb") as f:
-                    f.write(uploaded.getbuffer())
+        for uploaded in uploaded_files:
 
-                # Extract text
-                if dest.suffix.lower() == ".pdf":
-                    chapter_text = extract_text_from_pdf(dest)
-                else:
-                    chapter_text = extract_text_from_docx(dest)
+            st.session_state.status_text = f"Processing file: {uploaded.name}"
+            status_box.info(st.session_state.status_text)
 
-                chapter_title = extract_chapter_title(chapter_text)
 
-                matched_chapter = detect_chapter_from_db(
-                    chapter_title=chapter_title,
-                    filename=dest.name,
-                    grade_subject_id=subject_map[subject]
+            name = normalize_filename(uploaded.name)
+            dest = UPLOAD_DIR / name
+
+            with open(dest, "wb") as f:
+                f.write(uploaded.getbuffer())
+
+            # Extract text
+            if dest.suffix.lower() == ".pdf":
+                chapter_text = extract_text_from_pdf(dest)
+            else:
+                chapter_text = extract_text_from_docx(dest)
+        
+            # --------- CHAPTER DETECTION (CORRECT) ---------
+
+# Extract chapter title from text
+            chapter_title = extract_chapter_title(chapter_text)
+
+            # Detect chapter using DB (THIS IS THE ONLY FUNCTION CALL)
+            matched_chapter = detect_chapter_from_db(
+                chapter_title=chapter_title,
+                filename=dest.name,
+                grade_subject_id=subject_map[subject]
+            )
+
+            if not matched_chapter:
+                st.warning(f"⚠ Could not detect chapter for {dest.name}, skipping")
+                log(f"Chapter detection failed for {dest.name}")
+                continue
+
+            # ✅ FINAL chapter ID (JUST ASSIGN)
+            chapter_id = matched_chapter["id"]
+
+            st.success(
+                f"📘 {dest.name} → {matched_chapter['chapter_name']} (ID {chapter_id})"
+            )
+
+            # --------- FETCH LEARNING OBJECTIVES ---------
+
+            los = []
+            conn = get_db_conn()
+            if conn:
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    "SELECT id, objective_name, chapter_id FROM learning_objectives WHERE chapter_id=%s",
+                    (chapter_id,)
+                )
+                los = cur.fetchall()
+                cur.close()
+                conn.close()
+
+            # Fallback LO if none found
+            if not los:
+                los = [{
+                    "id": 1,
+                    "objective_name": f"Understand {matched_chapter['chapter_name']}",
+                    "chapter_id": chapter_id
+                }]
+
+            # --------- QUESTION GENERATION ---------
+
+            blooms = get_bloom_levels_for_grade(int(grade))
+            qid_start = 1
+            all_lo_outputs = []
+            total_los = len(los)
+            completed_los = 0
+
+
+            for lo in los:
+                questions, qid_start = generate_questions_for_lo(
+                    model,
+                    lo,
+                    int(grade),
+                    subject,
+                    blooms,
+                    chapter_text,
+                    qstart_id=qid_start
                 )
 
-                if not matched_chapter:
-                    log(f"Chapter detection failed for {dest.name}")
-                    continue
+                all_lo_outputs.append({
+                    "loId": lo["id"],
+                    "objective": lo["objective_name"],
+                    "questions": questions
+                })
 
-                chapter_id = matched_chapter["id"]
+                completed_los += 1
 
-                # Fetch learning objectives
-                los = []
-                conn = get_db_conn()
-                if conn:
-                    cur = conn.cursor(dictionary=True)
-                    cur.execute(
-                        "SELECT id, objective_name, chapter_id FROM learning_objectives WHERE chapter_id=%s",
-                        (chapter_id,)
-                    )
-                    los = cur.fetchall()
-                    cur.close()
-                    conn.close()
+                file_progress = completed_los / total_los
+                overall_progress = (
+                    (completed_files + file_progress) / total_files
+                )
 
-                if not los:
-                    los = [{
-                        "id": 1,
-                        "objective_name": f"Understand {matched_chapter['chapter_name']}",
-                        "chapter_id": chapter_id
-                    }]
+                st.session_state.progress_value = overall_progress
+                progress_bar.progress(min(overall_progress, 1.0))
+                percent_box.write(f"{int(overall_progress * 100)}% completed")
 
-                blooms = get_bloom_levels_for_grade(int(grade))
-                qid_start = 1
-                all_lo_outputs = []
-
-                for lo in los:
-                    questions, qid_start = generate_questions_for_lo(
-                        model,
-                        lo,
-                        int(grade),
-                        subject,
-                        blooms,
-                        chapter_text,
-                        qstart_id=qid_start
-                    )
-
-                    all_lo_outputs.append({
-                        "loId": lo["id"],
-                        "objective": lo["objective_name"],
-                        "questions": questions
-                    })
-
-                result = {
-                    "chapterId": chapter_id,
-                    "grade": int(grade),
-                    "subjectType": subject,
-                    "chapterName": matched_chapter["chapter_name"],
-                    "learningObjectives": all_lo_outputs
-                }
-
-                out_file = OUTPUT_DIR / f"chapter_{chapter_id}_{int(time.time())}.json"
-                with open(out_file, "w", encoding="utf-8") as f:
-                    json.dump(result, f, ensure_ascii=False, indent=2)
-
-                st.session_state.generated_files.append(str(out_file))
-                log(f"Generated {out_file}")
-
-        # ✅ UI UPDATE ONLY AFTER WORK IS DONE
-        st.session_state.lock_ui = False
-        st.success("✅ Question generation completed successfully")
+                st.session_state.status_text = (
+                    f"Generating questions → "
+                    f"File {completed_files + 1}/{total_files}, "
+                    f"LO {completed_los}/{total_los}"
+                )
+                status_box.info(st.session_state.status_text)
 
 
+            # --------- SAVE OUTPUT ---------
+
+            result = {
+                "chapterId": chapter_id,
+                "grade": int(grade),
+                "subjectType": subject,
+                "chapterName": matched_chapter["chapter_name"],
+                "learningObjectives": all_lo_outputs
+            }
+
+            out_file = OUTPUT_DIR / f"chapter_{chapter_id}_{int(time.time())}.json"
+
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+            st.success(f"✅ Generated: {out_file.name}")
+            completed_files += 1
+            st.session_state.generated_files.append(str(out_file))
+            log(f"Generated {out_file}")
+
+        st.session_state.is_generating = False
+        st.session_state.generation_done = True
+
+        st.session_state.status_text = "✅ Generation completed successfully"
+        st.session_state.progress_value = 1.0
+
+        progress_bar.progress(1.0)
+        percent_box.write("100% completed")
+        status_box.success(st.session_state.status_text)
     
 
 
@@ -1046,5 +1078,3 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
-
-
