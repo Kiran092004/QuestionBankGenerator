@@ -31,6 +31,14 @@ try:
 except Exception:
     mysql = None
 
+st.session_state.setdefault("is_generating", False)
+st.session_state.setdefault("generation_done", False)
+st.session_state.setdefault("generated_files", [])
+st.session_state.setdefault("status_text", "Idle")
+st.session_state.setdefault("progress_value", 0.0)
+
+
+
 # ------------------ Config & folders ------------------
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,14 +54,59 @@ for p in (DOCS_DIR, OUTPUT_DIR, UPLOAD_DIR):
 st.set_page_config(page_title='Assessment Question Generator', layout='wide', initial_sidebar_state='expanded')
 DARK_CSS = """
 <style>
-body { background-color: #0f1720; color: #e6eef6; }
-.header { color: #a7f3d0; }
-.card { background:#0b1220; border-radius:12px; padding:18px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); }
-.small { font-size:0.9rem; color:#bcdff9 }
-.logs { background:#021019; color:#cfeefe; padding:10px; border-radius:6px; font-family:monospace; }
-.btn { background: linear-gradient(90deg,#0ea5a5,#06b6d4); color:#052; border: none; padding: 8px 14px; border-radius:8px; }
+body {
+    background: radial-gradient(circle at top, #0f172a, #020617);
+    color: #e5e7eb;
+}
+
+.sidebar .sidebar-content {
+    background: linear-gradient(180deg, #020617, #020617);
+}
+
+.card {
+    background: linear-gradient(180deg, #020617, #020617);
+    border: 1px solid rgba(148,163,184,0.15);
+    border-radius: 18px;
+    padding: 22px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.55);
+}
+
+h1, h2, h3 {
+    color: #e0f2fe;
+}
+
+label {
+    color: #cbd5f5 !important;
+    font-weight: 500;
+}
+
+.stButton button {
+    background: linear-gradient(90deg,#2563eb,#38bdf8);
+    border-radius: 14px;
+    font-weight: 600;
+    padding: 10px 22px;
+    border: none;
+    box-shadow: 0 8px 20px rgba(37,99,235,0.4);
+}
+
+.stSelectbox > div,
+.stTextInput > div,
+.stNumberInput > div {
+    background: #020617;
+    border-radius: 12px;
+    border: 1px solid rgba(148,163,184,0.2);
+}
+
+.logs {
+    background:#020617;
+    border:1px solid rgba(148,163,184,0.15);
+    border-radius:14px;
+    padding:14px;
+    font-family: monospace;
+}
 </style>
 """
+
 st.markdown(DARK_CSS, unsafe_allow_html=True)
 
 # ------------------ MASTER_PROMPT (preserved exactly as provided) ------------------
@@ -151,6 +204,94 @@ def extract_text_from_docx(docx_path):
         log(f'DOCX extract error: {e}')
         return ''
 
+def extract_chapter_title(text):
+    if not text:
+        return None
+
+    lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 5]
+
+    patterns = [
+        r'chapter\s*\d+\s*[:\-]?\s*(.+)',
+        r'^\d+\.\s*(.+)',
+    ]
+
+    for line in lines[:15]:
+        for p in patterns:
+            m = re.search(p, line, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+    return lines[0][:120] if lines else None
+
+
+def fetch_subject_chapters(grade_subject_id):
+    conn = get_db_conn()
+    if not conn:
+        return []
+
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, chapter_name, chapter_no
+        FROM subject_chapters
+        WHERE grade_subject_id = %s
+    """, (grade_subject_id,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+def detect_chapter_from_db(chapter_title, filename, grade_subject_id, threshold=0.65):
+    chapters = fetch_subject_chapters(grade_subject_id)
+    if not chapters:
+        return None
+
+    title = (chapter_title or "").lower()
+    fname = filename.lower()
+    best = None
+    best_score = 0
+
+    for ch in chapters:
+        db_name = ch["chapter_name"].lower()
+
+        if title and (title in db_name or db_name in title):
+            return ch
+
+        if db_name in fname:
+            return ch
+
+        score = difflib.SequenceMatcher(None, title, db_name).ratio()
+        if score > best_score:
+            best_score = score
+            best = ch
+
+    if best_score >= threshold:
+        return best
+
+    return None
+
+def fetch_grades_with_names(learning_medium_id, board_id):
+    conn = get_db_conn()
+    if not conn:
+        return []
+
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, grade_name
+        FROM grades
+        WHERE id IN (
+            SELECT DISTINCT grade_id
+            FROM grade_subjects
+            WHERE learning_medium_id = %s
+              AND board_id = %s
+        )
+        ORDER BY id
+    """, (learning_medium_id, board_id))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
 # ------------------ API Key rotation & Gemini 2.5 setup ------------------
 def get_api_keys_from_env():
     keys = [os.getenv(f'GOOGLE_API_KEY_{i}') for i in range(1, 51) if os.getenv(f'GOOGLE_API_KEY_{i}')]
@@ -158,6 +299,8 @@ def get_api_keys_from_env():
 
 API_KEYS = get_api_keys_from_env()
 _api_index = 0
+CURRENT_API_KEY = None
+
 
 def get_next_api_key():
     global _api_index
@@ -168,13 +311,16 @@ def get_next_api_key():
     return key
 
 def setup_genai_model():
-    """
-    Returns a configured GenerativeModel instance for gemini-2.5-flash.
-    """
+    global CURRENT_API_KEY
+
     if genai is None:
         raise RuntimeError('google-generativeai package not installed')
-    genai.configure(api_key=get_next_api_key())
-    # Create a GenerativeModel instance
+
+    if CURRENT_API_KEY is None:
+        CURRENT_API_KEY = get_next_api_key()
+
+    genai.configure(api_key=CURRENT_API_KEY)
+
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         generation_config={
@@ -186,39 +332,53 @@ def setup_genai_model():
     )
     return model
 
-def safe_generate_content(model, prompt, retries=3, backoff=2):
-    """
-    model: instance returned by setup_genai_model()
-    Returns text output or None.
-    """
+
+def safe_generate_content(
+    model,
+    prompt,
+    retries_per_key=3,
+    max_key_rotations=2,
+    base_delay=2
+):
+    global CURRENT_API_KEY
+
     if model is None:
         return None
-    for attempt in range(1, retries + 1):
-        try:
-            response = model.generate_content(prompt)
-            # Gemini 2.5 Flash provides .text (preferred)
-            if hasattr(response, "text") and response.text and response.text.strip():
-                return response.text.strip()
-            # Fallback: examine candidates -> parts
-            out = ""
-            if hasattr(response, "candidates"):
-                for cand in response.candidates:
+
+    for rotation in range(max_key_rotations + 1):
+
+        for attempt in range(1, retries_per_key + 1):
+            try:
+                response = model.generate_content(prompt)
+
+                if hasattr(response, "text") and response.text:
+                    return response.text.strip()
+
+                out = ""
+                for cand in getattr(response, "candidates", []):
                     for part in getattr(cand.content, "parts", []):
                         if hasattr(part, "text"):
                             out += part.text
+
                 if out.strip():
                     return out.strip()
+
+            except Exception as e:
+                log(f"Gemini error (attempt {attempt}): {e}")
+                time.sleep(base_delay * attempt)
+
+        # 🔄 rotate key ONLY after retries
+        try:
+            CURRENT_API_KEY = get_next_api_key()
+            genai.configure(api_key=CURRENT_API_KEY)
+            model = setup_genai_model()
+            log("🔄 API key rotated")
         except Exception as e:
-            log(f"Gemini error attempt {attempt}: {e}")
-            # rotate key on quota/rate issues
-            if "429" in str(e) or "quota" in str(e).lower():
-                try:
-                    genai.configure(api_key=get_next_api_key())
-                    model = setup_genai_model()
-                except Exception as ex:
-                    log(f"Key rotation failed: {ex}")
-            time.sleep(backoff)
+            log(f"❌ Key rotation failed: {e}")
+            break
+
     return None
+
 
 # ------------------ Robust JSON extraction ------------------
 def extract_json_from_text(text):
@@ -327,9 +487,9 @@ def ask_model_to_fill_answers(model, raw_json_text):
 
 # ------------------ Generator flow ------------------
 def get_bloom_levels_for_grade(grade):
-    if grade <= 8:
+    if grade <= 11:
         return ['Remember', 'Understand', 'Apply']
-    elif grade <= 10:
+    elif grade <= 13:
         return ['Remember', 'Understand', 'Apply', 'Analyze']
     else:
         return ['Remember', 'Understand', 'Apply', 'Analyze', 'Evaluate', 'Create']
@@ -361,37 +521,29 @@ QuestionTypeDistribution (for THIS Bloom + Difficulty only):
 {json.dumps(question_type_distribution)}
 """
             prompt = MASTER_PROMPT.replace('<INPUT>', input_block)
-            raw = safe_generate_content(model, prompt, retries=3) if model else None
+            raw = safe_generate_content(
+                model,
+                prompt,
+                retries_per_key=2,
+                max_key_rotations=1
+            )
+
+            time.sleep(1.2)  # ⭐ cooldown
 
             parsed = None
             if raw:
                 parsed = extract_json_from_text(raw)
-
             if not parsed or 'questions' not in parsed:
-                # fallback placeholders
-                placeholders = {'questions': []}
-                for qtype, cnt in question_type_distribution.items():
-                    for _ in range(cnt):
-                        placeholders['questions'].append({
-                            'questionType': qtype,
-                            'questionText': f'{qtype} placeholder for LO {lo["id"]} ({bloom} D{difficulty})',
-                            'options': ["Option 1", "Option 2", "Option 3", "Option 4"] if qtype == 'MCQ' else [],
-                            'answer': ("Option 1" if qtype == 'MCQ' else "Model answer"),
-                            'explanation': 'Auto-generated placeholder explanation.',
-                            'hint': 'Auto-generated hint.',
-                            'estimatedTimeSec': 60
-                        })
-                parsed = placeholders
+                log(f"❌ Skipping LO {lo['id']} | {bloom} | D{difficulty} (Gemini failed)")
+                continue
+
 
             parsed = fill_missing_answers(parsed)
-            if count_missing_answers(parsed) > 0 and model is not None:
-                try:
-                    raw_parsed_text = json.dumps(parsed, ensure_ascii=False)
-                    filled = ask_model_to_fill_answers(model, raw_parsed_text)
-                    if filled and 'questions' in filled:
-                        parsed = fill_missing_answers(filled)
-                except Exception as e:
-                    log(f'ask_model_to_fill_answers error: {e}')
+
+            if count_missing_answers(parsed) > 0:
+                raw_fix = ask_model_to_fill_answers(model, json.dumps(parsed))
+                if raw_fix and 'questions' in raw_fix:
+                    parsed = fill_missing_answers(raw_fix)
 
             missing_final = count_missing_answers(parsed)
             if missing_final:
@@ -423,6 +575,8 @@ QuestionTypeDistribution (for THIS Bloom + Difficulty only):
     return all_questions, qid
 
 # ------------------ DB helpers ------------------
+
+
 def get_db_conn():
     cfg = {
         'host': os.getenv('DB_HOST'),
@@ -487,6 +641,143 @@ def insert_jsons_to_db(folder):
     conn.close()
     return True
 
+
+def fetch_subject_chapters(grade_subject_id):
+    conn = get_db_conn()
+    if not conn:
+        return []
+
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, chapter_name, chapter_no
+        FROM subject_chapters
+        WHERE grade_subject_id = %s
+    """, (grade_subject_id,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def extract_chapter_title(text):
+    """
+    Try to extract chapter title from first page text
+    """
+    if not text:
+        return None
+
+    lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 5]
+
+    patterns = [
+        r'chapter\s*\d+\s*[:\-]?\s*(.+)',
+        r'^\d+\.\s*(.+)',
+    ]
+
+    for line in lines[:15]:  # only first page lines
+        low = line.lower()
+        for p in patterns:
+            m = re.search(p, low, re.IGNORECASE)
+            if m:
+                return m.group(1).strip().title()
+
+    # fallback: first big heading
+    return lines[0][:120] if lines else None
+
+def detect_chapter_from_db(
+    chapter_title,
+    filename,
+    grade_subject_id,
+    threshold=0.65
+):
+    """
+    Match chapter title with DB chapter_name
+    """
+    chapters = fetch_subject_chapters(grade_subject_id)
+
+    if not chapters:
+        return None
+
+    candidates = []
+    title = (chapter_title or "").lower()
+    fname = filename.lower()
+
+    for ch in chapters:
+        db_name = ch["chapter_name"].lower()
+
+        # 1️⃣ Direct substring match
+        if title and (title in db_name or db_name in title):
+            return ch
+
+        # 2️⃣ Filename match
+        if db_name in fname:
+            return ch
+
+        # 3️⃣ Fuzzy score
+        score = difflib.SequenceMatcher(None, title, db_name).ratio()
+        candidates.append((score, ch))
+
+    # 4️⃣ Best fuzzy match
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    if candidates and candidates[0][0] >= threshold:
+        return candidates[0][1]
+
+    return None
+
+# ------------------ Dropdown Data Fetch ------------------
+
+def fetch_learning_mediums():
+    conn = get_db_conn()
+    if not conn:
+        return []
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, learning_medium_language FROM learning_medium")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+def fetch_boards():
+    conn = get_db_conn()
+    if not conn:
+        return []
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, board_name FROM education_boards")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+def fetch_grades(learning_medium_id, board_id):
+    conn = get_db_conn()
+    if not conn:
+        return []
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT grade_id 
+        FROM grade_subjects
+        WHERE learning_medium_id = %s AND board_id = %s
+        ORDER BY grade_id
+    """, (learning_medium_id, board_id))
+    grades = [r[0] for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return grades
+
+
+def fetch_subjects(learning_medium_id, board_id, grade_id):
+    conn = get_db_conn()
+    if not conn:
+        return []
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, subject_name
+        FROM grade_subjects
+        WHERE learning_medium_id = %s
+          AND board_id = %s
+          AND grade_id = %s
+        ORDER BY subject_name
+    """, (learning_medium_id, board_id, grade_id))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
 # ------------------ Streamlit UI ------------------
 st.sidebar.title('Generator — Dark Dashboard')
 mode = st.sidebar.radio('Mode', ['Generate', 'Insert to DB', 'View Outputs', 'Logs'])
@@ -496,10 +787,71 @@ if mode == 'Generate':
     st.header('Generate Questions')
     col1, col2 = st.columns([2, 1])
     with col1:
-        chapter_id = st.text_input('Chapter ID', value='30')
-        grade = st.number_input('Grade', min_value=6, max_value=12, value=9)
-        subject = st.text_input('Subject Type', value='English')
-        uploaded = st.file_uploader('Upload chapter (pdf/docx)', type=['pdf', 'docx'])
+        st.markdown("### 📘 Academic Configuration")
+
+# Fetch base data
+        learning_mediums = fetch_learning_mediums()
+        boards = fetch_boards()
+
+        lm_map = {lm['learning_medium_language']: lm['id'] for lm in learning_mediums}
+        board_map = {b['board_name']: b['id'] for b in boards}
+
+        colA, colB = st.columns(2)
+
+        with colA:
+            learning_medium = st.selectbox(
+                "Learning Medium",
+                options=list(lm_map.keys())
+            )
+
+            board = st.selectbox(
+                "Education Board",
+                options=list(board_map.keys())
+            )
+
+        with colB:
+            grade_rows = fetch_grades_with_names(
+                lm_map[learning_medium],
+                board_map[board]
+            )
+
+        if not grade_rows:
+            st.warning("No grades found for selected board and medium.")
+            st.stop()
+
+        grade_map = {g["grade_name"]: g["id"] for g in grade_rows}
+
+        selected_grade_name = st.selectbox(
+            "Grade",
+            options=list(grade_map.keys()),
+            index=0
+            )
+
+        grade = grade_map[selected_grade_name]  # ✅ SAFE NOW
+
+
+        subjects = fetch_subjects(
+                    lm_map[learning_medium],
+                    board_map[board],
+                    grade
+                )
+
+        subject_map = {s['subject_name']: s['id'] for s in subjects}
+
+        subject = st.selectbox(
+                "Subject",
+                options=list(subject_map.keys())
+            )
+
+        st.markdown("---")
+
+
+        uploaded_files = st.file_uploader(
+    "Upload chapter files (PDF/DOCX)",
+    type=["pdf", "docx"],
+    accept_multiple_files=True
+)
+
         existing_files = [f for f in os.listdir(DOCS_DIR) if f.lower().endswith(('.pdf', '.docx'))]
         gen_btn = st.button('Generate Questions', key='gen')
     with col2:
@@ -507,114 +859,173 @@ if mode == 'Generate':
         st.write(f'API keys configured: {len(API_KEYS)}')
         st.write(f'Output folder: {OUTPUT_DIR}')
         st.write('')
+        status_box = st.empty()
+        progress_bar = st.progress(0)
+        percent_box = st.empty()
+
 
     if gen_btn:
-        selected_path = None
-        if uploaded is not None:
+        st.session_state.is_generating = True
+        st.session_state.generation_done = False
+        st.session_state.generated_files = []
+
+
+        if not uploaded_files:
+            st.error("Please upload at least one chapter file")
+            st.stop()
+
+        model = setup_genai_model()
+
+        total_files = len(uploaded_files)
+        completed_files = 0
+
+        st.session_state.status_text = "Starting generation..."
+        st.session_state.progress_value = 0.0
+
+        status_box.info(st.session_state.status_text)
+        progress_bar.progress(0)
+        percent_box.write("0% completed")
+
+        for uploaded in uploaded_files:
+
+            st.session_state.status_text = f"Processing file: {uploaded.name}"
+            status_box.info(st.session_state.status_text)
+
+
             name = normalize_filename(uploaded.name)
             dest = UPLOAD_DIR / name
-            with open(dest, 'wb') as out:
-                out.write(uploaded.getbuffer())
-            selected_path = dest
-            st.success(f'Uploaded to {dest}')
-            log(f'Uploaded file {dest}')
 
-        try:
-            model = None
-            if API_KEYS and genai is not None:
-                try:
-                    model = setup_genai_model()
-                except Exception as e:
-                    log(f'GenAI setup failed: {e}')
-                    model = None
-        except Exception as e:
-            st.error(f'GenAI init failed: {e}')
-            log(f'GenAI init failed: {e}')
-            model = None
+            with open(dest, "wb") as f:
+                f.write(uploaded.getbuffer())
 
-        try:
-            # extract chapter text
-            if selected_path:
-                if selected_path.suffix.lower() == '.pdf':
-                    chapter_text = extract_text_from_pdf(selected_path)
-                else:
-                    chapter_text = extract_text_from_docx(selected_path)
+            # Extract text
+            if dest.suffix.lower() == ".pdf":
+                chapter_text = extract_text_from_pdf(dest)
             else:
-                detected = None
-                for f in existing_files:
-                    if str(chapter_id) in f:
-                        detected = DOCS_DIR / f
-                        break
-                if detected:
-                    if detected.suffix.lower() == '.pdf':
-                        chapter_text = extract_text_from_pdf(detected)
-                    else:
-                        chapter_text = extract_text_from_docx(detected)
-                    selected_path = detected
-                else:
-                    st.error('No document found. Upload a file or put it in the docs folder.')
-                    st.stop()
+                chapter_text = extract_text_from_docx(dest)
+        
+            # --------- CHAPTER DETECTION (CORRECT) ---------
 
-            # fetch LOs from DB if available, else create placeholder
+# Extract chapter title from text
+            chapter_title = extract_chapter_title(chapter_text)
+
+            # Detect chapter using DB (THIS IS THE ONLY FUNCTION CALL)
+            matched_chapter = detect_chapter_from_db(
+                chapter_title=chapter_title,
+                filename=dest.name,
+                grade_subject_id=subject_map[subject]
+            )
+
+            if not matched_chapter:
+                st.warning(f"⚠ Could not detect chapter for {dest.name}, skipping")
+                log(f"Chapter detection failed for {dest.name}")
+                continue
+
+            # ✅ FINAL chapter ID (JUST ASSIGN)
+            chapter_id = matched_chapter["id"]
+
+            st.success(
+                f"📘 {dest.name} → {matched_chapter['chapter_name']} (ID {chapter_id})"
+            )
+
+            # --------- FETCH LEARNING OBJECTIVES ---------
+
             los = []
-            try:
-                conn = get_db_conn()
-                if conn:
-                    cur = conn.cursor(dictionary=True)
-                    cur.execute('SELECT id, objective_name, chapter_id FROM learning_objectives WHERE chapter_id = %s', (chapter_id,))
-                    rows = cur.fetchall()
-                    cur.close(); conn.close()
-                    if rows:
-                        los = rows
-            except Exception as e:
-                log(f'LO fetch failed: {e}')
+            conn = get_db_conn()
+            if conn:
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    "SELECT id, objective_name, chapter_id FROM learning_objectives WHERE chapter_id=%s",
+                    (chapter_id,)
+                )
+                los = cur.fetchall()
+                cur.close()
+                conn.close()
 
+            # Fallback LO if none found
             if not los:
-                los = [{'id': 190, 'objective_name': f'LO1: Understand {selected_path.stem}', 'chapter_id': int(chapter_id)}]
+                los = [{
+                    "id": 1,
+                    "objective_name": f"Understand {matched_chapter['chapter_name']}",
+                    "chapter_id": chapter_id
+                }]
+
+            # --------- QUESTION GENERATION ---------
 
             blooms = get_bloom_levels_for_grade(int(grade))
-
-            all_lo_outputs = []
-            progress_bar = st.progress(0)
-            total_steps = len(los) * len(blooms) * 3
-            step = 0
             qid_start = 1
+            all_lo_outputs = []
+            total_los = len(los)
+            completed_los = 0
+
 
             for lo in los:
-                if 'chapter_id' not in lo:
-                    lo['chapter_id'] = int(chapter_id)
-                questions, qid_start = generate_questions_for_lo(model, lo, int(grade), subject, blooms, chapter_text, qstart_id=qid_start)
-                lo_out = {
-                    'loId': lo['id'],
-                    'objective': lo.get('objective_name', ''),
-                    'bloomLevels': blooms,
-                    'totalQuestions': len(questions),
-                    'questions': questions
-                }
-                all_lo_outputs.append(lo_out)
-                step += len(blooms) * 3
-                progress_bar.progress(min(1.0, step / max(1, total_steps)))
+                questions, qid_start = generate_questions_for_lo(
+                    model,
+                    lo,
+                    int(grade),
+                    subject,
+                    blooms,
+                    chapter_text,
+                    qstart_id=qid_start
+                )
+
+                all_lo_outputs.append({
+                    "loId": lo["id"],
+                    "objective": lo["objective_name"],
+                    "questions": questions
+                })
+
+                completed_los += 1
+
+                file_progress = completed_los / total_los
+                overall_progress = (
+                    (completed_files + file_progress) / total_files
+                )
+
+                st.session_state.progress_value = overall_progress
+                progress_bar.progress(min(overall_progress, 1.0))
+                percent_box.write(f"{int(overall_progress * 100)}% completed")
+
+                st.session_state.status_text = (
+                    f"Generating questions → "
+                    f"File {completed_files + 1}/{total_files}, "
+                    f"LO {completed_los}/{total_los}"
+                )
+                status_box.info(st.session_state.status_text)
+
+
+            # --------- SAVE OUTPUT ---------
 
             result = {
-                'chapterId': int(chapter_id),
-                'grade': int(grade),
-                'subjectType': subject,
-                'chapterName': selected_path.stem if selected_path else '',
-                'learningObjectives': all_lo_outputs
+                "chapterId": chapter_id,
+                "grade": int(grade),
+                "subjectType": subject,
+                "chapterName": matched_chapter["chapter_name"],
+                "learningObjectives": all_lo_outputs
             }
 
-            out_file = OUTPUT_DIR / f'chapter_{chapter_id}_streamlit_{int(time.time())}.json'
-            with open(out_file, 'w', encoding='utf-8') as f:
+            out_file = OUTPUT_DIR / f"chapter_{chapter_id}_{int(time.time())}.json"
+
+            with open(out_file, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
-            st.success(f'Generated: {out_file}')
-            st.write('Preview (first LO):')
-            if all_lo_outputs:
-                st.json(all_lo_outputs[0])
-            log(f'Generated file {out_file}')
-        except Exception as e:
-            st.error(f'Generation failed: {e}')
-            log(f'Generation failed: {e}')
+            st.success(f"✅ Generated: {out_file.name}")
+            completed_files += 1
+            st.session_state.generated_files.append(str(out_file))
+            log(f"Generated {out_file}")
+
+        st.session_state.is_generating = False
+        st.session_state.generation_done = True
+
+        st.session_state.status_text = "✅ Generation completed successfully"
+        st.session_state.progress_value = 1.0
+
+        progress_bar.progress(1.0)
+        percent_box.write("100% completed")
+        status_box.success(st.session_state.status_text)
+    
+
 
 elif mode == 'Insert to DB':
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -633,12 +1044,32 @@ elif mode == 'Insert to DB':
 elif mode == 'View Outputs':
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.header('Generated Outputs')
-    files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('.json')]
-    for f in sorted(files, reverse=True):
-        st.write(f)
-        if st.button(f'Download {f}', key=f):
-            with open(OUTPUT_DIR / f, 'rb') as fh:
-                st.download_button(label=f'Download {f}', data=fh, file_name=f)
+
+    files = (
+        st.session_state.generated_files
+        if st.session_state.generated_files
+        else [
+            str(OUTPUT_DIR / f)
+            for f in os.listdir(OUTPUT_DIR)
+            if f.endswith(".json")
+        ]
+    )
+
+    if not files:
+        st.info("No generated JSON files found.")
+    else:
+        for path in sorted(files, reverse=True):
+            fname = os.path.basename(path)
+            st.write(fname)
+
+            with open(path, "rb") as fh:
+                st.download_button(
+                    label=f"Download {fname}",
+                    data=fh,
+                    file_name=fname,
+                    key=fname
+                )
+
 
 elif mode == 'Logs':
     st.header('Logs')
