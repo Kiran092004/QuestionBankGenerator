@@ -899,7 +899,9 @@ if mode == 'Generate':
 
         model = setup_genai_model()
 
-        with st.spinner("⏳ Generating questions, please wait..."):
+        # ✅ ONLY ONE UI MESSAGE DURING LONG TASK
+        with st.spinner("⏳ Generating questions. This may take a few minutes..."):
+
             for uploaded in uploaded_files:
 
                 name = normalize_filename(uploaded.name)
@@ -914,7 +916,6 @@ if mode == 'Generate':
                 else:
                     chapter_text = extract_text_from_docx(dest)
 
-                # Extract chapter title
                 chapter_title = extract_chapter_title(chapter_text)
 
                 matched_chapter = detect_chapter_from_db(
@@ -985,9 +986,9 @@ if mode == 'Generate':
                 st.session_state.generated_files.append(str(out_file))
                 log(f"Generated {out_file}")
 
+        # ✅ UI UPDATE ONLY AFTER WORK IS DONE
         st.session_state.lock_ui = False
         st.success("✅ Question generation completed successfully")
-
 
 
     
