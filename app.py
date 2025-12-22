@@ -37,6 +37,14 @@ st.session_state.setdefault("generated_files", [])
 st.session_state.setdefault("status_text", "Idle")
 st.session_state.setdefault("progress_value", 0.0)
 
+st.set_page_config(
+    page_title="Assessment Question Generator",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+if "app_started" not in st.session_state:
+    st.session_state.app_started = True
 
 
 # ------------------ Config & folders ------------------
@@ -1079,3 +1087,4 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
+
