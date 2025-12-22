@@ -11,7 +11,7 @@ if "app_started" not in st.session_state:
 import os
 import re
 import json
-import times
+import time
 import unicodedata
 import difflib
 from pathlib import Path
@@ -1090,5 +1090,6 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
+
 
 
