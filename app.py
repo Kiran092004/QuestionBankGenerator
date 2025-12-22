@@ -8,6 +8,15 @@ st.set_page_config(
 
 if "app_started" not in st.session_state:
     st.session_state.app_started = True
+
+# ------------------ SAFE UI UPDATE (CRITICAL FOR RENDER) ------------------
+def safe_ui_update(fn):
+    try:
+        fn()
+    except Exception:
+        # Session is already gone (Render sleep / disconnect)
+        pass
+
 import os
 import re
 import json
@@ -43,6 +52,7 @@ except Exception:
 
 
 st.session_state.setdefault("is_generating", False)
+st.session_state.setdefault("lock_ui", False)
 st.session_state.setdefault("generation_done", False)
 st.session_state.setdefault("generated_files", [])
 st.session_state.setdefault("status_text", "Idle")
@@ -791,7 +801,17 @@ def fetch_subjects(learning_medium_id, board_id, grade_id):
 
 # ------------------ Streamlit UI ------------------
 st.sidebar.title('Generator — Dark Dashboard')
-mode = st.sidebar.radio('Mode', ['Generate', 'Insert to DB', 'View Outputs', 'Logs'])
+
+if st.session_state.get("lock_ui", False):
+    st.sidebar.warning("⚙️ Generation in progress… Please wait")
+    st.stop()
+
+mode = st.sidebar.radio(
+    'Mode',
+    ['Generate', 'Insert to DB', 'View Outputs', 'Logs']
+)
+
+
 
 if mode == 'Generate':
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -876,9 +896,12 @@ if mode == 'Generate':
 
 
     if gen_btn:
+        st.session_state.lock_ui = True
         st.session_state.is_generating = True
         st.session_state.generation_done = False
         st.session_state.generated_files = []
+        st.session_state.lock_ui = False
+
 
 
         if not uploaded_files:
@@ -893,14 +916,17 @@ if mode == 'Generate':
         st.session_state.status_text = "Starting generation..."
         st.session_state.progress_value = 0.0
 
-        status_box.info(st.session_state.status_text)
-        progress_bar.progress(0)
-        percent_box.write("0% completed")
+        safe_ui_update(lambda: status_box.info("Starting generation..."))
+        safe_ui_update(lambda: progress_bar.progress(0))
+        safe_ui_update(lambda: percent_box.write("0% completed"))
+
 
         for uploaded in uploaded_files:
 
-            st.session_state.status_text = f"Processing file: {uploaded.name}"
-            status_box.info(st.session_state.status_text)
+            safe_ui_update(
+                lambda: status_box.info(f"Processing file: {uploaded.name}")
+            )
+
 
 
             name = normalize_filename(uploaded.name)
@@ -995,15 +1021,23 @@ if mode == 'Generate':
                 )
 
                 st.session_state.progress_value = overall_progress
-                progress_bar.progress(min(overall_progress, 1.0))
-                percent_box.write(f"{int(overall_progress * 100)}% completed")
-
-                st.session_state.status_text = (
-                    f"Generating questions → "
-                    f"File {completed_files + 1}/{total_files}, "
-                    f"LO {completed_los}/{total_los}"
+                safe_ui_update(
+                    lambda: progress_bar.progress(min(overall_progress, 1.0))
                 )
-                status_box.info(st.session_state.status_text)
+
+                safe_ui_update(
+                    lambda: percent_box.write(
+                        f"{int(overall_progress * 100)}% completed"
+                    )
+                )
+                safe_ui_update(
+                    lambda: status_box.info(
+                        f"Generating questions → "
+                        f"File {completed_files + 1}/{total_files}, "
+                        f"LO {completed_los}/{total_los}"
+                    )
+                )
+
 
 
             # --------- SAVE OUTPUT ---------
@@ -1032,9 +1066,12 @@ if mode == 'Generate':
         st.session_state.status_text = "✅ Generation completed successfully"
         st.session_state.progress_value = 1.0
 
-        progress_bar.progress(1.0)
-        percent_box.write("100% completed")
-        status_box.success(st.session_state.status_text)
+        safe_ui_update(lambda: progress_bar.progress(1.0))
+        safe_ui_update(lambda: percent_box.write("100% completed"))
+        safe_ui_update(lambda: status_box.success(
+            "✅ Generation completed successfully"
+        ))
+
     
 
 
@@ -1090,6 +1127,5 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
-
 
 
