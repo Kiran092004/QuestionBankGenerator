@@ -11,7 +11,7 @@ if "app_started" not in st.session_state:
 import os
 import re
 import json
-import time
+import times
 import unicodedata
 import difflib
 from pathlib import Path
@@ -63,7 +63,6 @@ for p in (DOCS_DIR, OUTPUT_DIR, UPLOAD_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 # ------------------ UI styling ------------------
-st.set_page_config(page_title='Assessment Question Generator', layout='wide', initial_sidebar_state='expanded')
 DARK_CSS = """
 <style>
 body {
@@ -1091,6 +1090,5 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
-
 
 
