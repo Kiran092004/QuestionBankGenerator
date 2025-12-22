@@ -33,9 +33,6 @@ except Exception:
 st.session_state.setdefault("is_generating", False)
 st.session_state.setdefault("generation_done", False)
 st.session_state.setdefault("generated_files", [])
-st.session_state.setdefault("status_text", "Idle")
-st.session_state.setdefault("progress_value", 0.0)
-
 
 
 # ------------------ Config & folders ------------------
@@ -267,29 +264,6 @@ def detect_chapter_from_db(chapter_title, filename, grade_subject_id, threshold=
         return best
 
     return None
-
-def fetch_grades_with_names(learning_medium_id, board_id):
-    conn = get_db_conn()
-    if not conn:
-        return []
-
-    cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT id, grade_name
-        FROM grades
-        WHERE id IN (
-            SELECT DISTINCT grade_id
-            FROM grade_subjects
-            WHERE learning_medium_id = %s
-              AND board_id = %s
-        )
-        ORDER BY id
-    """, (learning_medium_id, board_id))
-
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
 
 # ------------------ API Key rotation & Gemini 2.5 setup ------------------
 def get_api_keys_from_env():
@@ -809,35 +783,25 @@ if mode == 'Generate':
             )
 
         with colB:
-            grade_rows = fetch_grades_with_names(
+            grades = fetch_grades(
                 lm_map[learning_medium],
                 board_map[board]
             )
 
-        if not grade_rows:
-            st.warning("No grades found for selected board and medium.")
-            st.stop()
-
-        grade_map = {g["grade_name"]: g["id"] for g in grade_rows}
-
-        selected_grade_name = st.selectbox(
-            "Grade",
-            options=list(grade_map.keys()),
-            index=0
+            grade = st.selectbox(
+                "Grade",
+                options=grades
             )
 
-        grade = grade_map[selected_grade_name]  # ✅ SAFE NOW
+            subjects = fetch_subjects(
+                lm_map[learning_medium],
+                board_map[board],
+                grade
+            )
 
+            subject_map = {s['subject_name']: s['id'] for s in subjects}
 
-        subjects = fetch_subjects(
-                    lm_map[learning_medium],
-                    board_map[board],
-                    grade
-                )
-
-        subject_map = {s['subject_name']: s['id'] for s in subjects}
-
-        subject = st.selectbox(
+            subject = st.selectbox(
                 "Subject",
                 options=list(subject_map.keys())
             )
@@ -858,10 +822,6 @@ if mode == 'Generate':
         st.write(f'API keys configured: {len(API_KEYS)}')
         st.write(f'Output folder: {OUTPUT_DIR}')
         st.write('')
-        status_box = st.empty()
-        progress_bar = st.progress(0)
-        percent_box = st.empty()
-
 
     if gen_btn:
         st.session_state.is_generating = True
@@ -875,21 +835,7 @@ if mode == 'Generate':
 
         model = setup_genai_model()
 
-        total_files = len(uploaded_files)
-        completed_files = 0
-
-        st.session_state.status_text = "Starting generation..."
-        st.session_state.progress_value = 0.0
-
-        status_box.info(st.session_state.status_text)
-        progress_bar.progress(0)
-        percent_box.write("0% completed")
-
         for uploaded in uploaded_files:
-
-            st.session_state.status_text = f"Processing file: {uploaded.name}"
-            status_box.info(st.session_state.status_text)
-
 
             name = normalize_filename(uploaded.name)
             dest = UPLOAD_DIR / name
@@ -954,9 +900,6 @@ if mode == 'Generate':
             blooms = get_bloom_levels_for_grade(int(grade))
             qid_start = 1
             all_lo_outputs = []
-            total_los = len(los)
-            completed_los = 0
-
 
             for lo in los:
                 questions, qid_start = generate_questions_for_lo(
@@ -975,25 +918,6 @@ if mode == 'Generate':
                     "questions": questions
                 })
 
-                completed_los += 1
-
-                file_progress = completed_los / total_los
-                overall_progress = (
-                    (completed_files + file_progress) / total_files
-                )
-
-                st.session_state.progress_value = overall_progress
-                progress_bar.progress(min(overall_progress, 1.0))
-                percent_box.write(f"{int(overall_progress * 100)}% completed")
-
-                st.session_state.status_text = (
-                    f"Generating questions → "
-                    f"File {completed_files + 1}/{total_files}, "
-                    f"LO {completed_los}/{total_los}"
-                )
-                status_box.info(st.session_state.status_text)
-
-
             # --------- SAVE OUTPUT ---------
 
             result = {
@@ -1010,20 +934,12 @@ if mode == 'Generate':
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
             st.success(f"✅ Generated: {out_file.name}")
-            completed_files += 1
             st.session_state.generated_files.append(str(out_file))
             log(f"Generated {out_file}")
 
         st.session_state.is_generating = False
         st.session_state.generation_done = True
 
-        st.session_state.status_text = "✅ Generation completed successfully"
-        st.session_state.progress_value = 1.0
-
-        progress_bar.progress(1.0)
-        percent_box.write("100% completed")
-        status_box.success(st.session_state.status_text)
-    
 
 
 elif mode == 'Insert to DB':
