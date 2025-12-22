@@ -10,12 +10,7 @@ if "app_started" not in st.session_state:
     st.session_state.app_started = True
 
 # ------------------ SAFE UI UPDATE (CRITICAL FOR RENDER) ------------------
-def safe_ui_update(fn):
-    try:
-        fn()
-    except Exception:
-        # Session is already gone (Render sleep / disconnect)
-        pass
+
 
 import os
 import re
@@ -890,187 +885,110 @@ if mode == 'Generate':
         st.write(f'API keys configured: {len(API_KEYS)}')
         st.write(f'Output folder: {OUTPUT_DIR}')
         st.write('')
-        status_box = st.empty()
-        progress_bar = st.progress(0)
-        percent_box = st.empty()
+
 
 
     if gen_btn:
         st.session_state.lock_ui = True
-        st.session_state.is_generating = True
-        st.session_state.generation_done = False
         st.session_state.generated_files = []
-        st.session_state.lock_ui = False
-
-
 
         if not uploaded_files:
             st.error("Please upload at least one chapter file")
+            st.session_state.lock_ui = False
             st.stop()
 
         model = setup_genai_model()
 
-        total_files = len(uploaded_files)
-        completed_files = 0
+        with st.spinner("⏳ Generating questions, please wait..."):
+            for uploaded in uploaded_files:
 
-        st.session_state.status_text = "Starting generation..."
-        st.session_state.progress_value = 0.0
+                name = normalize_filename(uploaded.name)
+                dest = UPLOAD_DIR / name
 
-        safe_ui_update(lambda: status_box.info("Starting generation..."))
-        safe_ui_update(lambda: progress_bar.progress(0))
-        safe_ui_update(lambda: percent_box.write("0% completed"))
+                with open(dest, "wb") as f:
+                    f.write(uploaded.getbuffer())
 
+                # Extract text
+                if dest.suffix.lower() == ".pdf":
+                    chapter_text = extract_text_from_pdf(dest)
+                else:
+                    chapter_text = extract_text_from_docx(dest)
 
-        for uploaded in uploaded_files:
+                # Extract chapter title
+                chapter_title = extract_chapter_title(chapter_text)
 
-            safe_ui_update(
-                lambda: status_box.info(f"Processing file: {uploaded.name}")
-            )
-
-
-
-            name = normalize_filename(uploaded.name)
-            dest = UPLOAD_DIR / name
-
-            with open(dest, "wb") as f:
-                f.write(uploaded.getbuffer())
-
-            # Extract text
-            if dest.suffix.lower() == ".pdf":
-                chapter_text = extract_text_from_pdf(dest)
-            else:
-                chapter_text = extract_text_from_docx(dest)
-        
-            # --------- CHAPTER DETECTION (CORRECT) ---------
-
-# Extract chapter title from text
-            chapter_title = extract_chapter_title(chapter_text)
-
-            # Detect chapter using DB (THIS IS THE ONLY FUNCTION CALL)
-            matched_chapter = detect_chapter_from_db(
-                chapter_title=chapter_title,
-                filename=dest.name,
-                grade_subject_id=subject_map[subject]
-            )
-
-            if not matched_chapter:
-                st.warning(f"⚠ Could not detect chapter for {dest.name}, skipping")
-                log(f"Chapter detection failed for {dest.name}")
-                continue
-
-            # ✅ FINAL chapter ID (JUST ASSIGN)
-            chapter_id = matched_chapter["id"]
-
-            st.success(
-                f"📘 {dest.name} → {matched_chapter['chapter_name']} (ID {chapter_id})"
-            )
-
-            # --------- FETCH LEARNING OBJECTIVES ---------
-
-            los = []
-            conn = get_db_conn()
-            if conn:
-                cur = conn.cursor(dictionary=True)
-                cur.execute(
-                    "SELECT id, objective_name, chapter_id FROM learning_objectives WHERE chapter_id=%s",
-                    (chapter_id,)
-                )
-                los = cur.fetchall()
-                cur.close()
-                conn.close()
-
-            # Fallback LO if none found
-            if not los:
-                los = [{
-                    "id": 1,
-                    "objective_name": f"Understand {matched_chapter['chapter_name']}",
-                    "chapter_id": chapter_id
-                }]
-
-            # --------- QUESTION GENERATION ---------
-
-            blooms = get_bloom_levels_for_grade(int(grade))
-            qid_start = 1
-            all_lo_outputs = []
-            total_los = len(los)
-            completed_los = 0
-
-
-            for lo in los:
-                questions, qid_start = generate_questions_for_lo(
-                    model,
-                    lo,
-                    int(grade),
-                    subject,
-                    blooms,
-                    chapter_text,
-                    qstart_id=qid_start
+                matched_chapter = detect_chapter_from_db(
+                    chapter_title=chapter_title,
+                    filename=dest.name,
+                    grade_subject_id=subject_map[subject]
                 )
 
-                all_lo_outputs.append({
-                    "loId": lo["id"],
-                    "objective": lo["objective_name"],
-                    "questions": questions
-                })
+                if not matched_chapter:
+                    log(f"Chapter detection failed for {dest.name}")
+                    continue
 
-                completed_los += 1
+                chapter_id = matched_chapter["id"]
 
-                file_progress = completed_los / total_los
-                overall_progress = (
-                    (completed_files + file_progress) / total_files
-                )
-
-                st.session_state.progress_value = overall_progress
-                safe_ui_update(
-                    lambda: progress_bar.progress(min(overall_progress, 1.0))
-                )
-
-                safe_ui_update(
-                    lambda: percent_box.write(
-                        f"{int(overall_progress * 100)}% completed"
+                # Fetch learning objectives
+                los = []
+                conn = get_db_conn()
+                if conn:
+                    cur = conn.cursor(dictionary=True)
+                    cur.execute(
+                        "SELECT id, objective_name, chapter_id FROM learning_objectives WHERE chapter_id=%s",
+                        (chapter_id,)
                     )
-                )
-                safe_ui_update(
-                    lambda: status_box.info(
-                        f"Generating questions → "
-                        f"File {completed_files + 1}/{total_files}, "
-                        f"LO {completed_los}/{total_los}"
+                    los = cur.fetchall()
+                    cur.close()
+                    conn.close()
+
+                if not los:
+                    los = [{
+                        "id": 1,
+                        "objective_name": f"Understand {matched_chapter['chapter_name']}",
+                        "chapter_id": chapter_id
+                    }]
+
+                blooms = get_bloom_levels_for_grade(int(grade))
+                qid_start = 1
+                all_lo_outputs = []
+
+                for lo in los:
+                    questions, qid_start = generate_questions_for_lo(
+                        model,
+                        lo,
+                        int(grade),
+                        subject,
+                        blooms,
+                        chapter_text,
+                        qstart_id=qid_start
                     )
-                )
+
+                    all_lo_outputs.append({
+                        "loId": lo["id"],
+                        "objective": lo["objective_name"],
+                        "questions": questions
+                    })
+
+                result = {
+                    "chapterId": chapter_id,
+                    "grade": int(grade),
+                    "subjectType": subject,
+                    "chapterName": matched_chapter["chapter_name"],
+                    "learningObjectives": all_lo_outputs
+                }
+
+                out_file = OUTPUT_DIR / f"chapter_{chapter_id}_{int(time.time())}.json"
+                with open(out_file, "w", encoding="utf-8") as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+
+                st.session_state.generated_files.append(str(out_file))
+                log(f"Generated {out_file}")
+
+        st.session_state.lock_ui = False
+        st.success("✅ Question generation completed successfully")
 
 
-
-            # --------- SAVE OUTPUT ---------
-
-            result = {
-                "chapterId": chapter_id,
-                "grade": int(grade),
-                "subjectType": subject,
-                "chapterName": matched_chapter["chapter_name"],
-                "learningObjectives": all_lo_outputs
-            }
-
-            out_file = OUTPUT_DIR / f"chapter_{chapter_id}_{int(time.time())}.json"
-
-            with open(out_file, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-
-            st.success(f"✅ Generated: {out_file.name}")
-            completed_files += 1
-            st.session_state.generated_files.append(str(out_file))
-            log(f"Generated {out_file}")
-
-        st.session_state.is_generating = False
-        st.session_state.generation_done = True
-
-        st.session_state.status_text = "✅ Generation completed successfully"
-        st.session_state.progress_value = 1.0
-
-        safe_ui_update(lambda: progress_bar.progress(1.0))
-        safe_ui_update(lambda: percent_box.write("100% completed"))
-        safe_ui_update(lambda: status_box.success(
-            "✅ Generation completed successfully"
-        ))
 
     
 
