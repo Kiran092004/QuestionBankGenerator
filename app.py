@@ -1,4 +1,13 @@
+import streamlit as st
 
+st.set_page_config(
+    page_title="Assessment Question Generator",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+if "app_started" not in st.session_state:
+    st.session_state.app_started = True
 import os
 import re
 import json
@@ -8,7 +17,7 @@ import difflib
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-import streamlit as st
+
 
 # Optional libs
 try:
@@ -31,14 +40,7 @@ try:
 except Exception:
     mysql = None
 
-st.set_page_config(
-    page_title="Assessment Question Generator",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-if "app_started" not in st.session_state:
-    st.session_state.app_started = True
 
 st.session_state.setdefault("is_generating", False)
 st.session_state.setdefault("generation_done", False)
@@ -1089,5 +1091,6 @@ elif mode == 'Logs':
     if st.button('Clear logs'):
         open(LOG_FILE, 'w').close()
         st.experimental_rerun()
+
 
 
