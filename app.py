@@ -226,7 +226,7 @@ def extract_chapter_title(text):
 
     return lines[0][:120] if lines else None
 
-
+@st.cache_data(ttl=600)
 def fetch_subject_chapters(grade_subject_id):
     conn = get_db_conn()
     if not conn:
@@ -277,7 +277,12 @@ def get_api_keys_from_env():
     keys = [os.getenv(f'GOOGLE_API_KEY_{i}') for i in range(1, 51) if os.getenv(f'GOOGLE_API_KEY_{i}')]
     return [k for k in keys if k]
 
-API_KEYS = get_api_keys_from_env()
+@st.cache_resource
+def load_api_keys():
+    return get_api_keys_from_env()
+
+API_KEYS = load_api_keys()
+
 _api_index = 0
 CURRENT_API_KEY = None
 
@@ -702,7 +707,7 @@ def detect_chapter_from_db(
     return None
 
 # ------------------ Dropdown Data Fetch ------------------
-
+@st.cache_data(ttl=600)
 def fetch_learning_mediums():
     conn = get_db_conn()
     if not conn:
@@ -713,7 +718,7 @@ def fetch_learning_mediums():
     cur.close(); conn.close()
     return rows
 
-
+@st.cache_data(ttl=600)
 def fetch_boards():
     conn = get_db_conn()
     if not conn:
@@ -724,7 +729,7 @@ def fetch_boards():
     cur.close(); conn.close()
     return rows
 
-
+@st.cache_data(ttl=600)
 def fetch_grades(learning_medium_id, board_id):
     conn = get_db_conn()
     if not conn:
@@ -740,7 +745,7 @@ def fetch_grades(learning_medium_id, board_id):
     cur.close(); conn.close()
     return grades
 
-
+@st.cache_data(ttl=600)
 def fetch_subjects(learning_medium_id, board_id, grade_id):
     conn = get_db_conn()
     if not conn:
@@ -757,6 +762,13 @@ def fetch_subjects(learning_medium_id, board_id, grade_id):
     rows = cur.fetchall()
     cur.close(); conn.close()
     return rows
+
+@st.cache_data(ttl=300)
+def get_existing_files():
+    return [
+        f for f in os.listdir(DOCS_DIR)
+        if f.lower().endswith(('.pdf', '.docx'))
+    ]
 
 # ------------------ Streamlit UI ------------------
 st.sidebar.title('Generator — Dark Dashboard')
@@ -807,17 +819,28 @@ if mode == 'Generate':
                 st.warning("Select Learning Medium and Board")
                 st.stop()
 
-            grades = fetch_grades(lm_id, board_id)
+            grades = []
+
+            if lm_id and board_id:
+                grades = fetch_grades(lm_id, board_id)
+
             if not grades:
-                st.warning("No grades found for this selection")
+                st.info("Select Learning Medium and Board to load grades")
                 st.stop()
+
+            
 
             grade = st.selectbox("Grade", options=grades)
 
-            subjects = fetch_subjects(lm_id, board_id, grade)
+            subjects = []
+
+            if lm_id and board_id and grade:
+                subjects = fetch_subjects(lm_id, board_id, grade)
+
             if not subjects:
-                st.warning("No subjects found for this selection")
+                st.info("Select Grade to load subjects")
                 st.stop()
+
 
             subject_map = {s['subject_name']: s['id'] for s in subjects}
 
@@ -835,7 +858,7 @@ if mode == 'Generate':
     accept_multiple_files=True
 )
 
-        existing_files = [f for f in os.listdir(DOCS_DIR) if f.lower().endswith(('.pdf', '.docx'))]
+        existing_files = get_existing_files()
         gen_btn = st.button('Generate Questions', key='gen')
     with col2:
         st.write('Settings')
