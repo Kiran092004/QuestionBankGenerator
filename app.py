@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -31,9 +32,6 @@ except Exception:
     mysql = None
 
 st.session_state.setdefault("is_generating", False)
-st.session_state.setdefault("generation_done", False)
-st.session_state.setdefault("generated_files", [])
-
 
 # ------------------ Config & folders ------------------
 load_dotenv()
@@ -107,50 +105,59 @@ st.markdown(DARK_CSS, unsafe_allow_html=True)
 
 # ------------------ MASTER_PROMPT (preserved exactly as provided) ------------------
 MASTER_PROMPT = """
-You are an expert teacher, assessment designer, and Bloom’s Taxonomy specialist. Generate curriculum-aligned, competency-based questions for grades 6–12. Output must follow JSON schema for database mapping.
+You are an expert teacher and Bloom’s Taxonomy assessment designer.
 
-TASK: For given chapter content, grade, subjectType, and Bloom’s categories, generate questions for each Bloom category using the *exact* counts per question type given in "QuestionTypeDistribution".
+TASK:
+Generate curriculum-aligned questions for grades 6–12 based on:
+- chapter content
+- grade
+- subjectType
+- Bloom categories
+- QuestionTypeDistribution (exact counts)
 
 RULES:
-- Each Bloom level must follow the same question-type counts from QuestionTypeDistribution.
-- Do NOT add or remove types randomly.
--Thier language should be same as subjectType (e.g., English questions for English subject).
--Their should be Question on Each Bloom Level No Bloom should be skipped.
--Their should be Question with every Difficulty Level from 1 to 3.
-- Give Numerical Questions also when subjectType is "Maths" or "Physics".
-- Use Latex when subjectType is "Maths" or "Physics.
-- Do NOT label options (❌ no A/B/C/D or 1/2/3/4).
-- Options must appear clean, e.g., ["Paris", "London", "Rome", "Berlin"].
-- Explanations must be based only on the question (no “chapter”, “text”, or “passage” references).
-- Hints must be conceptual (no “refer to text”).
-- Output must be VALID JSON only — no markdown, comments, or extra text. Start with '{' and end with '}'.
+- Generate questions for ALL Bloom levels (none skipped).
+- Follow QuestionTypeDistribution exactly for EACH Bloom level.
+- Include difficulty levels 1, 2, and 3 across questions.
+- Language must match subjectType.
+- If subjectType is Maths or Physics:
+  - include numerical questions
+  - use LaTeX for formulas
+- Do NOT label options (no A/B/C/D).
+- Options format: ["opt1","opt2","opt3","opt4"]
+- Explanations must be question-based only.
+- Hints must be conceptual.
+- Output VALID JSON ONLY (no markdown, no text outside JSON).
 
 INPUT:
 <INPUT>
 
-OUTPUT JSON (only JSON, no extra text):
+OUTPUT:
 {
- "chapterId": <id>,
- "grade": <grade>,
- "subjectType": "<type>",
- "learningObjective": "<text>",
- "questions": [
-   {
-     "id": <int>,
-     "bloomCategory": "<Remember/Understand/...>",
-     "difficultyLevel": <1–3>,
-     "questionType": "<MCQ/FIB/Short/Desc>",
-     "questionText": "<string>",
-     "options": ["option1","option2","option3","option4"],
-     "answer": "<string>",
-     "explanation": "<why correct — question-based only>",
-     "hint": "<conceptual approach>",
-     "estimatedTimeSec": <int>,
-     "mysqlRow": {...}
-   }
- ]
+  "chapterId": <id>,
+  "grade": <grade>,
+  "subjectType": "<type>",
+  "learningObjective": "<text>",
+  "questions": [
+    {
+      "id": <int>,
+      "bloomCategory": "<Remember/Understand/Apply/Analyze/Evaluate/Create>",
+      "difficultyLevel": <1-3>,
+      "questionType": "<MCQ/FIB/Short/Desc>",
+      "questionText": "<string>",
+      "options": ["..."],
+      "answer": "<string>",
+      "explanation": "<why correct>",
+      "hint": "<conceptual hint>",
+      "estimatedTimeSec": <int>,
+      "mysqlRow": {}
+    }
+  ]
 }
-VALIDATE: JSON syntax must be valid. Each question must include explanation, hint, marks/time, and proper Bloom verb alignment.
+
+VALIDATE:
+- JSON must start with { and end with }.
+- Every question must include explanation, hint, and correct Bloom verb.
 """
 
 # ------------------ Logging ------------------
@@ -799,10 +806,6 @@ if mode == 'Generate':
                 grade
             )
 
-            if not subjects:
-                st.error("❌ No subjects found for selected Grade / Board / Medium")
-                st.stop()
-
             subject_map = {s['subject_name']: s['id'] for s in subjects}
 
             subject = st.selectbox(
@@ -810,15 +813,14 @@ if mode == 'Generate':
                 options=list(subject_map.keys())
             )
 
-
         st.markdown("---")
 
-        uploaded_files = st.file_uploader(
-            "Upload chapter files (PDF/DOCX)",
-            type=["pdf", "docx"],
-            accept_multiple_files=True
-        )
 
+        uploaded_files = st.file_uploader(
+    "Upload chapter files (PDF/DOCX)",
+    type=["pdf", "docx"],
+    accept_multiple_files=True
+)
 
         existing_files = [f for f in os.listdir(DOCS_DIR) if f.lower().endswith(('.pdf', '.docx'))]
         gen_btn = st.button('Generate Questions', key='gen')
@@ -828,11 +830,8 @@ if mode == 'Generate':
         st.write(f'Output folder: {OUTPUT_DIR}')
         st.write('')
 
-    if gen_btn:
+    if gen_btn and not st.session_state.is_generating:
         st.session_state.is_generating = True
-        st.session_state.generation_done = False
-        st.session_state.generated_files = []
-
 
         if not uploaded_files:
             st.error("Please upload at least one chapter file")
@@ -853,23 +852,17 @@ if mode == 'Generate':
                 chapter_text = extract_text_from_pdf(dest)
             else:
                 chapter_text = extract_text_from_docx(dest)
-        
+
             # --------- CHAPTER DETECTION (CORRECT) ---------
 
 # Extract chapter title from text
             chapter_title = extract_chapter_title(chapter_text)
 
             # Detect chapter using DB (THIS IS THE ONLY FUNCTION CALL)
-            subject_id = subject_map.get(subject)
-
-            if not subject_id:
-                st.error("❌ Invalid subject selection")
-                continue
-
             matched_chapter = detect_chapter_from_db(
                 chapter_title=chapter_title,
                 filename=dest.name,
-                grade_subject_id=subject_id
+                grade_subject_id=subject_map[subject]
             )
 
             if not matched_chapter:
@@ -945,11 +938,7 @@ if mode == 'Generate':
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
             st.success(f"✅ Generated: {out_file.name}")
-            st.session_state.generated_files.append(str(out_file))
             log(f"Generated {out_file}")
-
-        st.session_state.is_generating = False
-        st.session_state.generation_done = True
 
 
 
@@ -970,32 +959,12 @@ elif mode == 'Insert to DB':
 elif mode == 'View Outputs':
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.header('Generated Outputs')
-
-    files = (
-        st.session_state.generated_files
-        if st.session_state.generated_files
-        else [
-            str(OUTPUT_DIR / f)
-            for f in os.listdir(OUTPUT_DIR)
-            if f.endswith(".json")
-        ]
-    )
-
-    if not files:
-        st.info("No generated JSON files found.")
-    else:
-        for path in sorted(files, reverse=True):
-            fname = os.path.basename(path)
-            st.write(fname)
-
-            with open(path, "rb") as fh:
-                st.download_button(
-                    label=f"Download {fname}",
-                    data=fh,
-                    file_name=fname,
-                    key=fname
-                )
-
+    files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('.json')]
+    for f in sorted(files, reverse=True):
+        st.write(f)
+        if st.button(f'Download {f}', key=f):
+            with open(OUTPUT_DIR / f, 'rb') as fh:
+                st.download_button(label=f'Download {f}', data=fh, file_name=f)
 
 elif mode == 'Logs':
     st.header('Logs')
