@@ -775,13 +775,23 @@ if mode == 'Generate':
 
         lm_map = {lm['learning_medium_language']: lm['id'] for lm in learning_mediums}
         board_map = {b['board_name']: b['id'] for b in boards}
+        
+
+        if not lm_map:
+            st.error("❌ No Learning Mediums found in database")
+            st.stop()
+
+        if not board_map:
+            st.error("❌ No Education Boards found in database")
+            st.stop()
 
         colA, colB = st.columns(2)
 
         with colA:
             learning_medium = st.selectbox(
                 "Learning Medium",
-                options=list(lm_map.keys())
+                options=list(lm_map.keys()),
+                index=0
             )
 
             board = st.selectbox(
@@ -790,21 +800,24 @@ if mode == 'Generate':
             )
 
         with colB:
-            grades = fetch_grades(
-                lm_map[learning_medium],
-                board_map[board]
-            )
+            lm_id = lm_map.get(learning_medium)
+            board_id = board_map.get(board)
 
-            grade = st.selectbox(
-                "Grade",
-                options=grades
-            )
+            if not lm_id or not board_id:
+                st.warning("Select Learning Medium and Board")
+                st.stop()
 
-            subjects = fetch_subjects(
-                lm_map[learning_medium],
-                board_map[board],
-                grade
-            )
+            grades = fetch_grades(lm_id, board_id)
+            if not grades:
+                st.warning("No grades found for this selection")
+                st.stop()
+
+            grade = st.selectbox("Grade", options=grades)
+
+            subjects = fetch_subjects(lm_id, board_id, grade)
+            if not subjects:
+                st.warning("No subjects found for this selection")
+                st.stop()
 
             subject_map = {s['subject_name']: s['id'] for s in subjects}
 
